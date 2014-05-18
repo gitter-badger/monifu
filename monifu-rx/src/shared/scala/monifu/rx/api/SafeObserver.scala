@@ -6,11 +6,13 @@ import monifu.concurrent.atomic.padded.Atomic
 
 abstract class SafeObserver[-T] protected (observer: Observer[_]) extends Observer[T] {
   private[this] val isComplete = Atomic(false)
+  @volatile private[this] var subscription: Subscription = null
 
   def handleNext(elem: T): Unit
 
-  def handleError(ex: Throwable): Unit =
-    observer.onError(ex)
+  def handleError(ex: Throwable): Unit = {
+    try observer.onError(ex) finally subscription.cancel()
+  }
 
   def handleComplete(): Unit =
     observer.onComplete()
@@ -28,7 +30,8 @@ abstract class SafeObserver[-T] protected (observer: Observer[_]) extends Observ
       handleComplete()
     }
 
-  final def onSubscription(s: Subscription) =
+  final def onSubscription(s: Subscription) = {
+    subscription = s
     observer.onSubscription(new Subscription {
       def cancel(): Unit = {
         isComplete set true
@@ -38,6 +41,7 @@ abstract class SafeObserver[-T] protected (observer: Observer[_]) extends Observ
       def request(n: Int): Unit =
         s.request(n)
     })
+  }
 }
 
 object SafeObserver {

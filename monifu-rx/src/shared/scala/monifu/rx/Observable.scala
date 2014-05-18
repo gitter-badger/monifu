@@ -6,16 +6,20 @@ import monifu.concurrent.atomic.padded.Atomic
 import scala.annotation.tailrec
 import java.lang.{Iterable => JavaIterable}
 import java.util.{Iterator => JavaIterator}
-import monifu.rx.api.SafeObserver
+import monifu.rx.api.{SafeObserver, WrappedObserver}
 
 
 trait Observable[+T] {
-  def subscribe(observer: Observer[T]): Unit
+  def subscribeFn(observer: Observer[T]): Unit
+
+  def subscribe(observer: Observer[T]): Unit = {
+    subscribeFn(SafeObserver(observer))
+  }
   
   def map[U](f: T => U): Observable[U] =
     Observable.create { observer =>
-      subscribe(new SafeObserver[T](observer) {
-        def handleNext(elem: T): Unit = {
+      subscribeFn(new WrappedObserver[T](observer) {
+        def onNext(elem: T): Unit = {
           var streamError = true
           try {
             val r = f(elem)
@@ -24,7 +28,7 @@ trait Observable[+T] {
           }
           catch {
             case NonFatal(ex) if streamError =>
-              onError(ex)
+              try subscription.cancel() finally onError(ex)
           }
         }
       })
@@ -32,8 +36,8 @@ trait Observable[+T] {
 
   def filter(p: T => Boolean): Observable[T] =
     Observable.create { observer =>
-      subscribe(new SafeObserver[T](observer) {
-        def handleNext(elem: T): Unit = {
+      subscribeFn(new WrappedObserver[T](observer) {
+        def onNext(elem: T): Unit = {
           var streamError = true
           try {
             val isValid = p(elem)
@@ -42,7 +46,7 @@ trait Observable[+T] {
           }
           catch {
             case NonFatal(ex) if streamError =>
-              onError(ex)
+              try subscription.cancel() finally onError(ex)
           }
         }
       })
@@ -50,7 +54,7 @@ trait Observable[+T] {
 
   def take(number: Int): Observable[T] =
     Observable.create { observer =>
-      subscribe(new Observer[T] {
+      subscribeFn(new Observer[T] {
         private[this] val remainingForRequest = Atomic(number)
         private[this] val processed = Atomic(0)
         @volatile private[this] var subscription: Subscription = null
@@ -91,15 +95,18 @@ trait Observable[+T] {
 
   def foldLeft[R](seed: R)(f: (R, T) => R): Observable[R] =
     Observable.create { observer =>
-      subscribe(new SafeObserver[T](observer) {
+      subscribeFn(new WrappedObserver[T](observer) {
         private[this] val result = Atomic(seed)
-        def handleNext(elem: T): Unit =
+
+        def onNext(elem: T): Unit =
           try {
             result.transform(r => f(r, elem))
           } catch {
-            case NonFatal(ex) => onError(ex)
+            case NonFatal(ex) =>
+              try subscription.cancel() finally onError(ex)
           }
-        override def handleComplete(): Unit = {
+
+        override def onComplete(): Unit = {
           observer.onNext(result.get)
           observer.onComplete()
         }
@@ -108,9 +115,10 @@ trait Observable[+T] {
 
   def scan[R](seed: R)(f: (R, T) => R): Observable[R] =
     Observable.create { observer =>
-      subscribe(new SafeObserver[T](observer) {
+      subscribeFn(new WrappedObserver[T](observer) {
         private[this] val result = Atomic(seed)
-        def handleNext(elem: T): Unit = {
+
+        def onNext(elem: T): Unit = {
           var streamError = true
           try {
             val next = result.transformAndGet(r => f(r, elem))
@@ -118,7 +126,7 @@ trait Observable[+T] {
             observer.onNext(next)
           } catch {
             case NonFatal(ex) if streamError =>
-              onError(ex)
+              try subscription.cancel() finally onError(ex)
           }
         }
       })
@@ -126,7 +134,7 @@ trait Observable[+T] {
 
   def doOnCompleted(cb: => Unit)(implicit ec: ExecutionContext): Observable[T] =
     Observable.create { observer =>
-      subscribe(new Observer[T] {
+      subscribeFn(new Observer[T] {
         def onComplete(): Unit = {
           ec.execute(new Runnable {
             def run(): Unit = cb
@@ -144,7 +152,7 @@ trait Observable[+T] {
     }
 
   def foreach(cb: T => Unit): Unit =
-    subscribe(new Observer[T] {
+    subscribeFn(new Observer[T] {
       @volatile
       private[this] var sub: Subscription = null
       private[this] val requested = Atomic(0)
@@ -185,7 +193,7 @@ trait Observable[+T] {
 object Observable {
   def create[T](f: Observer[T] => Unit): Observable[T] =
     new Observable[T] {
-      def subscribe(observer: Observer[T]): Unit = f(observer)
+      def subscribeFn(observer: Observer[T]): Unit = f(observer)
     }
 
   def unit[T](x: T)(implicit ec: ExecutionContext): Observable[T] =
