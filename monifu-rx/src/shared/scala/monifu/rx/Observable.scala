@@ -1,25 +1,46 @@
 package monifu.rx
 
 import scala.util.control.NonFatal
-import scala.concurrent.ExecutionContext
 import monifu.concurrent.atomic.padded.Atomic
 import scala.annotation.tailrec
 import java.lang.{Iterable => JavaIterable}
 import java.util.{Iterator => JavaIterator}
-import monifu.rx.api.{SafeObserver, WrappedObserver}
+import monifu.rx.api.SafeObserver
+import monifu.concurrent.Scheduler
 
 
+/**
+ * Representation for the Observable in the Rx pattern.
+ */
 trait Observable[+T] {
-  def subscribeFn(observer: Observer[T]): Unit
+  /**
+   * Function that creates the actual subscription when calling `subscribe`,
+   * and that starts the stream, being meant to be overridden in custom combinators
+   * or in classes implementing Observable.
+   *
+   * @param observer is an [[Observer]] on which `onNext`, `onComplete` and `onError`
+   *                 happens, according to the Rx grammar.
+   *
+   * @return a cancelable that can be used to cancel the streaming
+   */
+  def subscribe(observer: Observer[T]): Unit
 
-  def subscribe(observer: Observer[T]): Unit = {
-    subscribeFn(SafeObserver(observer))
-  }
-  
+  /**
+   * Implicit `scala.concurrent.ExecutionContext` under which our computations will run.
+   */
+  protected implicit def scheduler: Scheduler
+
+  /**
+   * Returns an Observable that applies the given function to each item emitted by an
+   * Observable and emits the result.
+   *
+   * @param f a function to apply to each item emitted by the Observable
+   * @return an Observable that emits the items from the source Observable, transformed by the given function
+   */
   def map[U](f: T => U): Observable[U] =
     Observable.create { observer =>
-      subscribeFn(new WrappedObserver[T](observer) {
-        def onNext(elem: T): Unit = {
+      subscribe(new SafeObserver[T](observer) {
+        def handleNext(elem: T): Unit = {
           var streamError = true
           try {
             val r = f(elem)
@@ -34,10 +55,16 @@ trait Observable[+T] {
       })
     }
 
+  /**
+   * Returns an Observable which only emits those items for which the given predicate holds.
+   *
+   * @param p a function that evaluates the items emitted by the source Observable, returning `true` if they pass the filter
+   * @return an Observable that emits only those items in the original Observable for which the filter evaluates as `true`
+   */
   def filter(p: T => Boolean): Observable[T] =
     Observable.create { observer =>
-      subscribeFn(new WrappedObserver[T](observer) {
-        def onNext(elem: T): Unit = {
+      subscribe(new SafeObserver[T](observer) {
+        def handleNext(elem: T): Unit = {
           var streamError = true
           try {
             val isValid = p(elem)
@@ -52,31 +79,34 @@ trait Observable[+T] {
       })
     }
 
-  def take(number: Int): Observable[T] =
+  /**
+   * Selects the first ''n'' elements (from the start).
+   *
+   *  @param n the number of elements to take
+   *  @return a new Observable that emits only the first ''n'' elements from the source
+   */
+  def take(n: Int): Observable[T] =
     Observable.create { observer =>
-      subscribeFn(new Observer[T] {
-        private[this] val remainingForRequest = Atomic(number)
+      subscribe(new SafeObserver[T](observer) {
+        private[this] val remainingForRequest = Atomic(n)
         private[this] val processed = Atomic(0)
-        @volatile private[this] var subscription: Subscription = null
 
-        def onSubscription(s: Subscription): Unit = {
-          subscription = s
-          observer.onSubscription(new Subscription {
+        override def handleSubscription(s: Subscription) =
+          new Subscription {
             def cancel(): Unit = {
-              subscription.cancel()
+              s.cancel()
             }
             def request(n: Int): Unit = {
               val rnr = remainingForRequest.countDownToZero(n)
-              if (rnr > 0) subscription.request(rnr)
+              if (rnr > 0) s.request(rnr)
             }
-          })
-        }
+          }
 
-        def onNext(elem: T): Unit = {
+        def handleNext(elem: T): Unit = {
           val processed = this.processed.incrementAndGet()
-          if (processed < number)
+          if (processed < n)
             observer.onNext(elem)
-          else if (processed == number)
+          else if (processed == n)
             try {
               observer.onNext(elem)
               observer.onComplete()
@@ -84,21 +114,20 @@ trait Observable[+T] {
               subscription.cancel()
             }
         }
-
-        def onError(ex: Throwable): Unit =
-          observer.onError(ex)
-
-        def onComplete(): Unit =
-          observer.onComplete()
       })
     }
 
+  /**
+   * Applies a binary operator to a start value and all elements of this Observable,
+   * going left to right and returns a new Observable that emits only one item
+   * before `onCompleted`.
+   */
   def foldLeft[R](seed: R)(f: (R, T) => R): Observable[R] =
     Observable.create { observer =>
-      subscribeFn(new WrappedObserver[T](observer) {
+      subscribe(new SafeObserver[T](observer) {
         private[this] val result = Atomic(seed)
 
-        def onNext(elem: T): Unit =
+        def handleNext(elem: T): Unit =
           try {
             result.transform(r => f(r, elem))
           } catch {
@@ -106,7 +135,7 @@ trait Observable[+T] {
               try subscription.cancel() finally onError(ex)
           }
 
-        override def onComplete(): Unit = {
+        override def handleComplete(): Unit = {
           observer.onNext(result.get)
           observer.onComplete()
         }
@@ -115,10 +144,10 @@ trait Observable[+T] {
 
   def scan[R](seed: R)(f: (R, T) => R): Observable[R] =
     Observable.create { observer =>
-      subscribeFn(new WrappedObserver[T](observer) {
+      subscribe(new SafeObserver[T](observer) {
         private[this] val result = Atomic(seed)
 
-        def onNext(elem: T): Unit = {
+        def handleNext(elem: T): Unit = {
           var streamError = true
           try {
             val next = result.transformAndGet(r => f(r, elem))
@@ -132,11 +161,22 @@ trait Observable[+T] {
       })
     }
 
-  def doOnCompleted(cb: => Unit)(implicit ec: ExecutionContext): Observable[T] =
+  /**
+   * Executes the given callback asynchronously, when the stream has
+   * ended on `onCompleted`.
+   *
+   * NOTE: protect the callback such that it doesn't throw exceptions, because
+   * it gets executed when `cancel()` happens and by definition the error cannot
+   * be streamed with `onError()` and so the behavior is left as undefined, possibly
+   * crashing the application or worse - leading to non-deterministic behavior.
+   *
+   * @param cb the callback to execute when the subscription is canceled
+   */
+  def doOnCompleted(cb: => Unit): Observable[T] =
     Observable.create { observer =>
-      subscribeFn(new Observer[T] {
+      subscribe(new Observer[T] {
         def onComplete(): Unit = {
-          ec.execute(new Runnable {
+          scheduler.execute(new Runnable {
             def run(): Unit = cb
           })
           observer.onComplete()
@@ -152,7 +192,7 @@ trait Observable[+T] {
     }
 
   def foreach(cb: T => Unit): Unit =
-    subscribeFn(new Observer[T] {
+    subscribe(new Observer[T] {
       @volatile
       private[this] var sub: Subscription = null
       private[this] val requested = Atomic(0)
@@ -191,16 +231,19 @@ trait Observable[+T] {
 }
 
 object Observable {
-  def create[T](f: Observer[T] => Unit): Observable[T] =
+  def create[T](f: Observer[T] => Unit)(implicit scheduler: Scheduler): Observable[T] = {
+    val s = scheduler
     new Observable[T] {
-      def subscribeFn(observer: Observer[T]): Unit = f(observer)
+      def subscribe(observer: Observer[T]): Unit = f(observer)
+      val scheduler = s
     }
+  }
 
-  def unit[T](x: T)(implicit ec: ExecutionContext): Observable[T] =
+  def unit[T](x: T)(implicit scheduler: Scheduler): Observable[T] =
     Observable.create { observer =>
       observer.onSubscription(new Subscription {
         def request(n: Int): Unit =
-          ec.execute(new Runnable {
+          scheduler.execute(new Runnable {
             def run(): Unit = {
               observer.onNext(x)
               observer.onComplete()
@@ -211,19 +254,19 @@ object Observable {
       })
     }
 
-  def empty(implicit ec: ExecutionContext): Observable[Nothing] =
+  def empty(implicit scheduler: Scheduler): Observable[Nothing] =
     Observable.create { observer =>
       observer.onSubscription(new Subscription {
         def cancel(): Unit = ()
         def request(n: Int): Unit =
-          ec.execute(new Runnable {
+          scheduler.execute(new Runnable {
             def run(): Unit =
               observer.onComplete()
           })
       })
     }
 
-  def never: Observable[Nothing] =
+  def never(implicit scheduler: Scheduler): Observable[Nothing] =
     Observable.create { observer =>
       observer.onSubscription(new Subscription {
         def request(n: Int): Unit = ()
@@ -231,19 +274,19 @@ object Observable {
       })
     }
 
-  def error(e: Throwable)(implicit ec: ExecutionContext): Observable[Nothing] =
+  def error(e: Throwable)(implicit scheduler: Scheduler): Observable[Nothing] =
     Observable.create { observer =>
       observer.onSubscription(new Subscription {
         def cancel(): Unit = ()
         def request(n: Int): Unit =
-          ec.execute(new Runnable {
+          scheduler.execute(new Runnable {
             def run(): Unit =
               observer.onError(e)
           })
       })
     }
 
-  def range(from: Int, until: Int, step: Int = 1)(implicit ec: ExecutionContext): Observable[Int] =
+  def range(from: Int, until: Int, step: Int = 1)(implicit scheduler: Scheduler): Observable[Int] =
     Observable.create { observer =>
       observer.onSubscription(new Subscription { self =>
         private[this] val requested = Atomic(0)
@@ -251,7 +294,7 @@ object Observable {
 
         def request(n: Int): Unit =
           if (requested.get != -1 && requested.getAndAdd(n) == 0)
-            ec.execute(new Runnable {
+            scheduler.execute(new Runnable {
               def run(): Unit = {
                 while (true) {
                   val requested = self.requested.get
@@ -286,7 +329,7 @@ object Observable {
       })
     }
 
-  def fromIterable[T](iterable: Iterable[T])(implicit ec: ExecutionContext): Observable[T] =
+  def fromIterable[T](iterable: Iterable[T])(implicit scheduler: Scheduler): Observable[T] =
     fromIterable(new JavaIterable[T] {
       def iterator(): JavaIterator[T] = {
         new JavaIterator[T] {
@@ -298,7 +341,7 @@ object Observable {
       }
     })
 
-  def fromIterable[T](iterable: JavaIterable[T])(implicit ec: ExecutionContext): Observable[T] =
+  def fromIterable[T](iterable: JavaIterable[T])(implicit scheduler: Scheduler): Observable[T] =
     Observable.create { observer =>
       observer.onSubscription(new Subscription {
         private[this] val capacity = Atomic(0)
@@ -307,7 +350,7 @@ object Observable {
 
         def request(n: Int): Unit =
           if (capacity.getAndAdd(n) == 0)
-            ec.execute(new Runnable {
+            scheduler.execute(new Runnable {
               def run(): Unit =
                 lock.synchronized {
                   if (iterator == null) iterator = iterable.iterator()
