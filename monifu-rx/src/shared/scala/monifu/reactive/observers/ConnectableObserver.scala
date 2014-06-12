@@ -90,7 +90,7 @@ final class ConnectableObserver[-T](underlying: Observer[T])(implicit s: Schedul
 
         Observable.from(queue).unsafeSubscribe(new Observer[T] {
           def onNext(elem: T) =
-            observer.onNext(elem).onCancelDoCancel(connectedPromise)
+            observer.onNext(elem).ifCancelTryCanceling(connectedPromise)
 
           def onError(ex: Throwable) = lock.enter {
             if (!isConnected) {

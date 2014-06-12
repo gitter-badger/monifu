@@ -9,11 +9,10 @@ import scala.concurrent.duration.{Duration, FiniteDuration}
 import scala.util.control.NonFatal
 import scala.annotation.tailrec
 import scala.util.{Failure, Success}
-import monifu.reactive.observers.{ConcurrentObserver, BufferedObserver, SafeObserver}
-import monifu.reactive.internals.{MergeBuffer, FutureAckExtensions}
-import monifu.reactive.observables.ConnectableObservable
+import monifu.reactive.observers.{SynchronousObserver, ConcurrentObserver, BufferedObserver, SafeObserver}
+import monifu.reactive.internals.{UnboundedMergeBuffer, BoundedMergeBuffer, FutureAckExtensions}
 import monifu.concurrent.atomic.Atomic
-import monifu.reactive.api.BufferPolicy.{Unbounded, BackPressured}
+import monifu.reactive.api.BufferPolicy.{OverflowTriggering, Unbounded, BackPressured}
 import scala.collection.mutable
 import monifu.concurrent.locks.SpinLock
 import monifu.reactive.api.Notification.{OnComplete, OnError, OnNext}
@@ -25,11 +24,11 @@ import monifu.syntax.TypeSafeEquals
 /**
  * Asynchronous implementation of the Observable interface
  */
-trait Observable[+T] { self =>
+trait Observable[+T] extends Publisher[T] { self =>
   /**
    * Characteristic function for an `Observable` instance,
-   * that creates the subscription and that starts the stream,
-   * being meant to be overridden in custom combinators
+   * that creates the subscription and that eventually starts the streaming of events
+   * to the given [[Observer]], being meant to be overridden in custom combinators
    * or in classes implementing Observable.
    *
    * @param observer is an [[Observer]] on which `onNext`, `onComplete` and `onError`
@@ -45,9 +44,21 @@ trait Observable[+T] { self =>
   /**
    * Creates the subscription and that starts the stream.
    *
-   * This function is "unsafe" to call because it does not wrap the given
-   * observer implementation in a [[monifu.reactive.observers.SafeObserver SafeObserver]],
-   * like the other subscribe functions are doing.
+   * @param observer is an [[monifu.reactive.Observer Observer]] on which `onNext`, `onComplete` and `onError`
+   *                 happens, according to the Monifu Rx contract.
+   */
+  final def subscribe(observer: Observer[T]): Unit = {
+    unsafeSubscribe(SafeObserver[T](observer))
+  }
+
+  /**
+   * Creates the subscription that eventually starts the stream.
+   *
+   * This function is "unsafe" to call because it does protect the calls to the
+   * given [[Observer]] implementation in regards to unexpected exceptions that
+   * violate the contract, therefore the given instance must respect its contract
+   * and not throw any exceptions when the observable calls `onNext`,
+   * `onComplete` and `onError`. if it does, then the behavior is undefined.
    *
    * @param observer is an [[monifu.reactive.Observer Observer]] that respects
    *                 Monifu Rx contract.
@@ -57,13 +68,35 @@ trait Observable[+T] { self =>
   }
 
   /**
-   * Creates the subscription and that starts the stream.
+   * Given a [[Subscriber]] instance it creates the subscription that eventually
+   * starts the streaming of events to the given [[Subscriber]].
    *
-   * @param observer is an [[monifu.reactive.Observer Observer]] on which `onNext`, `onComplete` and `onError`
-   *                 happens, according to the Monifu Rx contract.
+   * @param subscriber is a [[Subscriber]] instance on which `onSubscribe`, `onNext`,
+   *                   `onComplete` and `onError` events happen according to the
+   *                   [[http://www.reactive-streams.org/ Reactive Streams]]
+   *                   contract.
    */
-  final def subscribe(observer: Observer[T]): Unit = {
-    unsafeSubscribe(SafeObserver[T](observer))
+  final def subscribe(subscriber: Subscriber[T]): Unit = {
+    subscribe(Observer.from(subscriber))
+  }
+
+  /**
+   * Given a [[Subscriber]] instance it creates the subscription that eventually
+   * starts the streaming of events to the given [[Subscriber]].
+   *
+   * This function is "unsafe" to call because it does protect the calls to the
+   * given [[Subscriber]] implementation in regards to unexpected exceptions that
+   * violate the contract, therefore the given instance must respect its contract
+   * and not throw any exceptions when the publisher calls `onSubscribe`, `onNext`,
+   * `onComplete` and `onError`. If it does, then the behavior is undefined.
+   *
+   * @param subscriber is a [[Subscriber]] instance on which `onSubscribe`, `onNext`,
+   *                   `onComplete` and `onError` events happen according to the
+   *                   [[http://www.reactive-streams.org/ Reactive Streams]]
+   *                   contract.
+   */
+  final def unsafeSubscribe(subscriber: Subscriber[T]): Unit = {
+    unsafeSubscribe(Observer.from(subscriber))
   }
 
   /**
@@ -243,7 +276,8 @@ trait Observable[+T] { self =>
 
           childObservable.unsafeSubscribe(new Observer[U] {
             def onNext(elem: U) = {
-              observerU.onNext(elem).onCancelDoCancel(upstreamPromise)
+              observerU.onNext(elem)
+                .ifCancelTryCanceling(upstreamPromise)
             }
 
             def onError(ex: Throwable) = {
@@ -326,22 +360,34 @@ trait Observable[+T] { self =>
    */
   def merge[U](parallelism: Int, bufferPolicy: BufferPolicy)(implicit ev: T <:< Observable[U]): Observable[U] =
     Observable.create { observerB =>
-      unsafeSubscribe(new Observer[T] {
-        private[this] val buffer: MergeBuffer[U] =
-          new MergeBuffer[U](observerB, parallelism, bufferPolicy)
 
-        def onNext(elem: T) = {
-          buffer.merge(elem)
-        }
+      // if the parallelism is unbounded and the buffer policy allows for a
+      // synchronous buffer, then we can use a more efficient implementation
+      bufferPolicy match {
+        case Unbounded | OverflowTriggering(_) if parallelism <= 0 =>
+          unsafeSubscribe(new SynchronousObserver[T] {
+            private[this] val buffer =
+              new UnboundedMergeBuffer[U](observerB, bufferPolicy)
+            def onNext(elem: T): Ack =
+              buffer.merge(elem)
+            def onError(ex: Throwable): Unit =
+              buffer.onError(ex)
+            def onComplete(): Unit =
+              buffer.onComplete()
+          })
 
-        def onError(ex: Throwable) = {
-          buffer.onError(ex)
-        }
-
-        def onComplete() = {
-          buffer.onComplete()
-        }
-      })
+        case _ =>
+          unsafeSubscribe(new Observer[T] {
+            private[this] val buffer: BoundedMergeBuffer[U] =
+              new BoundedMergeBuffer[U](observerB, parallelism, bufferPolicy)
+            def onNext(elem: T) =
+              buffer.merge(elem)
+            def onError(ex: Throwable) =
+              buffer.onError(ex)
+            def onComplete() =
+              buffer.onComplete()
+          })
+      }
     }
 
   /**
@@ -988,7 +1034,7 @@ trait Observable[+T] { self =>
             def onNext(elem: R): Future[Ack] = {
               state = elem
               ack = observer.onNext(elem)
-                .onCancelDoCancel(upstreamPromise)
+                .ifCancelTryCanceling(upstreamPromise)
               ack
             }
 

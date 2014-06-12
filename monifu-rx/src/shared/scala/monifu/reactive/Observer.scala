@@ -1,6 +1,8 @@
 package monifu.reactive
 
-import scala.concurrent.Future
+import monifu.reactive.observers.SubscriberAsObserver
+
+import scala.concurrent.{ExecutionContext, Future}
 import monifu.reactive.api.Ack
 
 /**
@@ -22,3 +24,14 @@ trait Observer[-T] {
 
   def onComplete(): Unit
 }
+
+object Observer {
+  /**
+   * Given a [[Subscriber]] as defined by the [[http://www.reactive-streams.org/ Reactive Streams]]
+   * specification, it builds an [[Observer]] instance compliant with the Monifu Rx implementation.
+   */
+  def from[T](subscriber: Subscriber[T])(implicit ec: ExecutionContext): Observer[T] = {
+    SubscriberAsObserver(subscriber)
+  }
+}
+

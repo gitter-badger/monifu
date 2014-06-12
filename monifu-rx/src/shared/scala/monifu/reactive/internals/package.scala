@@ -59,7 +59,7 @@ package object internals {
     /**
      * On Cancel, triggers Cancel on the given Promise.
      */
-    def onCancelDoCancel(p: Promise[Ack])(implicit ec: ExecutionContext): Future[Ack] = {
+    def ifCancelTryCanceling(p: Promise[Ack])(implicit ec: ExecutionContext): Future[Ack] = {
       source match {
         case Continue => // do nothing
         case Cancel => p.trySuccess(Cancel)
