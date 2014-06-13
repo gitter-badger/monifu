@@ -1774,10 +1774,15 @@ trait Observable[+T] extends Publisher[T] { self =>
   def repeat: Observable[T] = {
     def loop(subject: Subject[T, T], observer: Observer[T]): Unit =
       subject.subscribe(new Observer[T] {
-        def onNext(elem: T) = observer.onNext(elem)
+        private[this] var lastResponse = Continue : Future[Ack]
+        def onNext(elem: T) = {
+          lastResponse = observer.onNext(elem)
+          lastResponse
+        }
         def onError(ex: Throwable) = observer.onError(ex)
-        def onComplete(): Unit =
-          scheduler.scheduleOnce(loop(subject, observer))
+        def onComplete(): Unit = {
+          lastResponse.onContinue(loop(subject, observer))
+        }
       })
 
     Observable.create { observer =>
@@ -2195,13 +2200,13 @@ object Observable {
       def startFeedLoop(iterator: Iterator[T]): Unit =
         scheduler.execute(new Runnable {
           @tailrec
-          def loop(): Unit = {
+          def fastLoop(): Unit = {
             val ack = observer.onNext(iterator.next())
             if (iterator.hasNext)
               ack match {
                 case sync if sync.isCompleted =>
                   if (sync === Continue || sync.value.get === Continue.IsSuccess)
-                    loop()
+                    fastLoop()
                 case async =>
                   async.onSuccess {
                     case Continue =>
@@ -2213,7 +2218,7 @@ object Observable {
           }
 
           def run(): Unit = {
-            try loop() catch {
+            try fastLoop() catch {
               case NonFatal(ex) =>
                 observer.onError(ex)
             }

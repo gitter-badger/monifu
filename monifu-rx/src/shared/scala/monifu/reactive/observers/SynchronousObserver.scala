@@ -11,7 +11,7 @@ import monifu.reactive.api.Ack
  * 
  * Can be used for optimizations.
  */
-abstract class SynchronousObserver[-T] extends Observer[T] {
+trait SynchronousObserver[-T] extends Observer[T] {
   /**
    * Returns either a [[monifu.reactive.api.Ack.Continue Continue]] or a
    * [[monifu.reactive.api.Ack.Cancel Cancel]], in response to an `elem` event
